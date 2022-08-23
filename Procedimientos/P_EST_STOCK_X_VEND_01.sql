@@ -1,0 +1,448 @@
+-- EXEC V_EST_STOCK_X_VEND_01 '000001','MPFERTILIZANTES',2
+CREATE PROCEDURE P_EST_STOCK_X_VEND_01
+	@VEND VARCHAR(6)
+	,@PROD VARCHAR(15)
+	,@TPVISUAL TINYINT = 1
+AS
+
+DECLARE @HOY VARCHAR(8) = FORMAT(GETDATE(), 'yyyyMMdd')
+DECLARE @MV_XSTKVEN VARCHAR(100) = (SELECT RTRIM(X6_CONTSPA) FROM SX6010 WHERE X6_VAR = 'MV_XSTKVEN')
+
+CREATE TABLE #FILDEP (
+	NNR_CODIGO VARCHAR(2)
+	,NNR_DESCRI VARCHAR(20)
+	,NNR_XTIPO VARCHAR(1))
+
+CREATE TABLE #FILPROD (
+	PRODUCTO VARCHAR(15))
+
+CREATE TABLE #SALDO_FINAL (
+	CODDEP VARCHAR(2)
+	,DESDEP VARCHAR(20)
+	,TIPDEP VARCHAR(1)
+	,COD VARCHAR(15)
+	,DESCRIP VARCHAR(30)
+	,XBANDA VARCHAR(1)
+	,XCODIGO VARCHAR(4)
+	,XDESCRI VARCHAR(40)
+	,STOCKFISICO FLOAT
+	,PVPEND FLOAT
+	,PCPEND FLOAT
+	,SLDDEVOL FLOAT
+	,TRFENTPEND FLOAT
+	,TRFSALPEND FLOAT
+	,REFPROD FLOAT
+	,PRODC FLOAT
+	,ASIGVIG FLOAT
+	,SOLTRF FLOAT
+	,ASIGOTROS FLOAT)
+
+CREATE TABLE #STOCKDEVOLUCION (
+	PRODUTO VARCHAR(15)
+	,DEPOSITO VARCHAR(2)
+	,XCODIGO VARCHAR(4)
+	,XDESCRI VARCHAR(40)
+	,SLDDEVOL FLOAT
+)
+
+--|-----------------------------------------
+--| Solo depositos definidos por parametro
+--|-----------------------------------------
+INSERT INTO #FILDEP
+	SELECT NNR_CODIGO
+		,NNR_DESCRI
+		,CASE WHEN NNR_XTIPO = '' THEN 'P' ELSE NNR_XTIPO END
+	FROM dbo.FN_SPLIT(@MV_XSTKVEN, ',') FILDEP
+		INNER JOIN NNR010 NNR
+			ON FILDEP.ITEMS = NNR.NNR_CODIGO
+			AND NNR.D_E_L_E_T_ <> '*'
+
+--|-------------------------------------------------
+--| Filtro por producto
+--| por ahora es un solo producto
+--| pero en caso de necesitar mas, aplicar logica
+--| en table tmp de filtros
+--|-------------------------------------------------
+INSERT INTO #FILPROD
+	VALUES (@PROD)
+
+--|---------------------------
+--| Stock de devolucion
+--| segun tabla de depositos
+--|---------------------------
+INSERT INTO #STOCKDEVOLUCION
+	SELECT B8_PRODUTO
+		,B8_LOCAL
+		,B8_XCODIGO
+		,B8_XDESCRI
+		,SUM(B8_SALDO) AS SLDDEVOL
+	FROM SB8010 SB8
+		INNER JOIN #FILPROD
+			ON B8_PRODUTO = PRODUCTO
+		INNER JOIN SB1010 PROD
+			ON B1_COD = SB8.B8_PRODUTO
+			AND B1_RASTRO IN ('L','S')
+			AND PROD.D_E_L_E_T_ <> '*'
+		INNER JOIN NNR010 NNR
+			ON SB8.B8_LOCAL = NNR.NNR_XDEVOL
+			AND NNR.D_E_L_E_T_ <> '*'
+	WHERE SB8.D_E_L_E_T_ <> '*'
+	GROUP BY B8_PRODUTO
+		,B8_LOCAL
+		,B8_XCODIGO
+		,B8_XDESCRI
+
+INSERT INTO #STOCKDEVOLUCION
+	SELECT B2_COD
+		,B2_LOCAL
+		,''
+		,''
+		,SUM(B2_QATU) AS SLDDEVOL
+	FROM SB2010 SB2
+		INNER JOIN #FILPROD
+			ON B2_COD = PRODUCTO
+		INNER JOIN SB1010 PROD
+			ON B1_COD = SB2.B2_COD
+			AND B1_RASTRO IN ('N','')
+			AND PROD.D_E_L_E_T_ <> '*'
+		INNER JOIN NNR010 NNR
+			ON SB2.B2_LOCAL = NNR.NNR_XDEVOL
+			AND NNR.D_E_L_E_T_ <> '*'
+	WHERE SB2.D_E_L_E_T_ <> '*'
+	GROUP BY B2_COD
+		,B2_LOCAL
+
+--|---------------------
+--| Stock por vendedor
+--|---------------------
+SELECT ZA3_PROD
+	,ZA3_LOCAL
+	,ZA3_CODAD
+	,ZA3_DESCAD
+	,SUM(IIF(ZA3_VEND = @VEND, ZA3_SALDO, 0)) AS SLDVEND
+	,SUM(IIF(ZA3_VEND <> @VEND, ZA3_SALDO, 0)) AS OTROVEND
+INTO #STOCKVENDEDOR
+FROM ZA3010 ZA3
+	INNER JOIN #FILPROD
+		ON ZA3_PROD = PRODUCTO
+WHERE ZA3.D_E_L_E_T_ <> '*'
+AND @HOY BETWEEN ZA3_FECINI AND ZA3_FECFIN
+GROUP BY ZA3_PROD
+	,ZA3_LOCAL
+	,ZA3_CODAD
+	,ZA3_DESCAD
+
+--|---------------------
+--| Pedidos de compra
+--|---------------------
+SELECT C7_PRODUTO
+	,C7_LOCAL
+	,C7_XCODIGO
+	,SUM(C7_QUANT-C7_QUJE) AS PCPEND
+INTO #PEDIDOSCOMPRA
+FROM SC7010
+	INNER JOIN #FILPROD
+		ON C7_PRODUTO = PRODUCTO
+WHERE D_E_L_E_T_ <> '*'
+GROUP BY C7_PRODUTO
+	,C7_LOCAL
+	,C7_XCODIGO
+HAVING SUM(C7_QUANT-C7_QUJE) <> 0
+
+--|---------------------
+--| Pedidos de venta
+--|---------------------
+SELECT C6_PRODUTO
+	,C6_LOCAL
+	,C6_XCODADI
+	,SUM(C6_QTDVEN-C6_QTDENT) AS PVPEND
+INTO #PEDIDOSVENTA
+FROM SC6010 SC6
+	INNER JOIN #FILPROD
+		ON C6_PRODUTO = PRODUCTO
+	INNER JOIN SC5010 SC5
+		ON C6_NUM = C5_NUM
+		AND C5_TIPO = 'N'
+		AND SC5.D_E_L_E_T_ <> '*'
+WHERE SC5.D_E_L_E_T_ <> '*'
+GROUP BY C6_PRODUTO
+	,C6_LOCAL
+	,C6_XCODADI
+HAVING ROUND(SUM(C6_QTDVEN-C6_QTDENT),2) <> 0
+
+--|-------------------------------------------
+--| Pedidos de beneficiamiento (Rto. Transf.)
+--|-------------------------------------------
+SELECT C6_PRODUTO
+	,C6_LOCAL
+	,C6_LOCDEST
+	,C6_XCODADI
+	,SUM(C6_QTDVEN-C6_QTDENT) AS BENEFPEND
+INTO #PEDIDOSBENEF
+FROM SC6010 SC6
+	INNER JOIN #FILPROD
+		ON C6_PRODUTO = PRODUCTO
+	INNER JOIN SC5010 SC5
+		ON C6_NUM = C5_NUM
+		AND C5_TIPO = 'B'
+		AND SC5.D_E_L_E_T_ <> '*'
+WHERE SC5.D_E_L_E_T_ <> '*'
+GROUP BY C6_PRODUTO
+	,C6_LOCAL
+	,C6_LOCDEST
+	,C6_XCODADI
+HAVING ROUND(SUM(C6_QTDVEN-C6_QTDENT),2) <> 0
+
+--|---------------------------------
+--| Rto. de transferencia pendiente
+--|---------------------------------
+SELECT D2_COD
+	,D2_LOCAL
+	,D2_XCODIGO
+	,SUM(D2_QTDAFAT) TRFENTPEND
+INTO #RTOSALPEND
+FROM SD2010
+	INNER JOIN #FILPROD
+		ON D2_COD = PRODUCTO
+WHERE D2_ESPECIE = 'RTS'
+and D2_QTDAFAT > 0
+AND D_E_L_E_T_ <> '*'
+GROUP BY D2_COD
+	,D2_LOCAL
+	,D2_XCODIGO
+
+--|-----------------------
+--| Ordenes de produccion
+--|-----------------------
+SELECT C2_PRODUTO
+	,C2_LOCAL
+	,SUM(C2_QUANT-C2_QUJE) AS PRODUCT
+INTO #ORDPROD
+FROM SC2010
+	INNER JOIN #FILPROD
+		ON C2_PRODUTO = PRODUCTO
+WHERE D_E_L_E_T_ <> '*'
+GROUP BY C2_PRODUTO
+	,C2_LOCAL
+HAVING SUM(C2_QUANT-C2_QUJE) > 0
+
+--|----------
+--| Reservas
+--|----------
+SELECT D4_PRODUTO
+	,D4_LOCAL
+	,SUM(D4_QUANT) AS RESERVAS
+INTO #RESERVAS
+FROM SD4010
+WHERE D_E_L_E_T_ <> '*'
+GROUP BY D4_PRODUTO
+	,D4_LOCAL
+
+--|----------------------------------------
+--| Stock con lote (SB8)
+--| Se supone que son aquellos con banda
+--|----------------------------------------
+INSERT INTO #SALDO_FINAL
+	SELECT NNR_CODIGO									-- Codigo de deposito
+		,NNR_DESCRI										-- Descripcion de deposito
+		,NNR_XTIPO										-- Tipo de deposito
+		,B1_COD											-- Codigo de producto
+		,B1_DESC										-- Descripcion de producto
+		,B1_XBANDA										-- Codigo Banda
+		,LOTE.B8_XCODIGO								-- Codigo adicional
+		,LOTE.B8_XDESCRI								-- Descripcion adicional
+		,SUM(B8_SALDO) AS STOCKFISICO					-- 01 Sumatoria de B8_SALDO( producto mas descripcion adicional)
+		,ISNULL(PV.PVPEND, 0) AS PVPEND					-- 02 Sumatoria de (C6_QTDVEN-C6_QTDENT) de pedidos de venta normales según producto y descripcion adicional 
+		,ISNULL(PC.PCPEND, 0) AS PCPEND					-- 03 Sumatoria de saldos de pedidos de compra según producto y descripcion adicional
+		,ISNULL(ST_DEV.SLDDEVOL, 0) AS SLDDEVOL			-- 04 Sumatoria de B8_saldo que se encuentren en deposito de devolución
+		,ISNULL(TRFSAL.TRFENTPEND, 0) AS TRFENTPEND		-- 05 RTS pendientes de recibir
+		,ISNULL(BENEFORIG.BENEFPEND, 0) AS TRFSALPEND	-- 06 Sumatoria de (C6_QTDVEN-C6_QTDENT) de pedidos de venta beneficiamiento según producto y descripcion adicional 
+		,0 AS REFPROD									-- 07 Para lotes, no se usa
+		,0 AS PRODC										-- 08 Para lotes, no se usa
+		,ISNULL(ST_VEND.SLDVEND, 0) AS ASIGVIG			-- 09 ZA3_SALDO para vendedores y que se encuentre vigente
+		,ISNULL(BENEFDEST.BENEFPEND, 0) AS SOLTRF		-- 10
+		,ISNULL(ST_VEND.OTROVEND, 0) AS ASIGOTROS		-- 11 ZA3_SALDO de otros vendedores vigente
+	FROM SB8010 LOTE
+		INNER JOIN #FILPROD
+			ON LOTE.B8_PRODUTO = PRODUCTO
+		INNER JOIN #FILDEP
+			ON LOTE.B8_LOCAL = NNR_CODIGO
+		INNER JOIN SB1010 PROD
+			ON B1_COD = LOTE.B8_PRODUTO
+			AND B1_RASTRO IN ('L','S')
+			AND PROD.D_E_L_E_T_ <> '*'
+		LEFT JOIN #STOCKDEVOLUCION ST_DEV
+			ON ST_DEV.PRODUTO = LOTE.B8_PRODUTO
+			AND ST_DEV.DEPOSITO = LOTE.B8_LOCAL
+			AND ST_DEV.XCODIGO = LOTE.B8_XCODIGO
+		LEFT JOIN #STOCKVENDEDOR ST_VEND
+			ON ST_VEND.ZA3_PROD = LOTE.B8_PRODUTO
+			AND ST_VEND.ZA3_LOCAL = LOTE.B8_LOCAL
+			AND ST_VEND.ZA3_CODAD = LOTE.B8_XCODIGO
+		LEFT JOIN #PEDIDOSCOMPRA PC
+			ON C7_PRODUTO = LOTE.B8_PRODUTO
+			AND C7_LOCAL = LOTE.B8_LOCAL
+			AND C7_XCODIGO = LOTE.B8_XCODIGO
+		LEFT JOIN #PEDIDOSVENTA PV
+			ON PV.C6_PRODUTO = LOTE.B8_PRODUTO
+			AND PV.C6_LOCAL = LOTE.B8_LOCAL
+			AND PV.C6_XCODADI = LOTE.B8_XCODIGO
+		LEFT JOIN #PEDIDOSBENEF BENEFORIG
+			ON BENEFORIG.C6_PRODUTO = LOTE.B8_PRODUTO
+			AND BENEFORIG.C6_LOCAL = LOTE.B8_LOCAL
+			AND BENEFORIG.C6_XCODADI = LOTE.B8_XCODIGO
+		LEFT JOIN #PEDIDOSBENEF BENEFDEST
+			ON BENEFDEST.C6_PRODUTO = LOTE.B8_PRODUTO
+			AND BENEFDEST.C6_LOCDEST = LOTE.B8_LOCAL
+			AND BENEFDEST.C6_XCODADI = LOTE.B8_XCODIGO
+		LEFT JOIN #RTOSALPEND TRFSAL
+			ON TRFSAL.D2_COD = LOTE.B8_PRODUTO
+			AND TRFSAL.D2_LOCAL = LOTE.B8_LOCAL
+			AND TRFSAL.D2_XCODIGO = LOTE.B8_XCODIGO
+	WHERE LOTE.D_E_L_E_T_ <> '*'
+	GROUP BY NNR_CODIGO
+		,NNR_DESCRI
+		,NNR_XTIPO
+		,B1_COD
+		,B1_DESC
+		,B1_XBANDA
+		,LOTE.B8_XCODIGO
+		,LOTE.B8_XDESCRI
+		,PV.PVPEND
+		,PC.PCPEND
+		,ST_DEV.SLDDEVOL
+		,ST_VEND.SLDVEND
+		,ST_VEND.OTROVEND
+		,BENEFORIG.BENEFPEND
+		,BENEFDEST.BENEFPEND
+		,TRFSAL.TRFENTPEND
+
+--|----------------------------------------
+--| Stock general (SB2)
+--| Se supone que son aquellos sin banda
+--|----------------------------------------
+INSERT INTO #SALDO_FINAL
+	SELECT NNR_CODIGO
+		,NNR_DESCRI
+		,NNR_XTIPO
+		,B1_COD											-- Codigo de producto
+		,B1_DESC										-- Descripcion de producto
+		,B1_XBANDA										-- Codigo Banda
+		,''
+		,''
+		,SUM(B2_QATU) AS STOCKFISICO					-- 01 Sumatoria de B8_SALDO( producto mas descripcion adicional)
+		,ISNULL(PV.PVPEND, 0) AS PVPEND					-- 02 Sumatoria de (C6_QTDVEN-C6_QTDENT) de pedidos de venta normales según producto y descripcion adicional 
+		,ISNULL(PC.PCPEND, 0) AS PCPEND					-- 03 Sumatoria de saldos de pedidos de compra según producto y descripcion adicional
+		,ISNULL(ST_DEV.SLDDEVOL, 0) AS SLDDEVOL			-- 04 Sumatoria de B8_saldo que se encuentren en deposito de devolución
+		,ISNULL(TRFSAL.TRFENTPEND, 0) AS TRFENTPEND		-- 05 RTS pendientes de recibir
+		,ISNULL(BENEFORIG.BENEFPEND, 0) AS TRFSALPEND	-- 06 Sumatoria de (C6_QTDVEN-C6_QTDENT) de pedidos de venta beneficiamiento según producto y descripcion adicional 
+		,ISNULL(RESERV.RESERVAS, 0) AS REFPROD			-- 07 Reservas
+		,ISNULL(ORDPROD.PRODUCT, 0) AS PRODC			-- 08 Ordenes de produccion
+		,ISNULL(ST_VEND.SLDVEND, 0) AS ASIGVIG			-- 09 ZA3_SALDO para vendedores y que se encuentre vigente
+		,ISNULL(BENEFDEST.BENEFPEND, 0) AS SOLTRF		-- 10 Sumatoria de (C6_QTDVEN-C6_QTDENT) de pedidos de venta beneficiamiento según producto y descripcion adicional 
+		,ISNULL(ST_VEND.OTROVEND, 0) AS ASIGOTROS		-- 11 ZA3_SALDO de otros vendedores vigente
+	FROM SB2010 STGRAL
+		INNER JOIN #FILPROD
+			ON STGRAL.B2_COD = PRODUCTO
+		INNER JOIN #FILDEP
+			ON STGRAL.B2_LOCAL = NNR_CODIGO
+		INNER JOIN SB1010 PROD
+			ON B1_COD = STGRAL.B2_COD
+			AND B1_RASTRO IN ('N','')
+			AND PROD.D_E_L_E_T_ <> '*'
+		LEFT JOIN #STOCKDEVOLUCION ST_DEV
+			ON ST_DEV.PRODUTO = STGRAL.B2_COD
+			AND ST_DEV.DEPOSITO = STGRAL.B2_LOCAL
+		LEFT JOIN #STOCKVENDEDOR ST_VEND
+			ON ST_VEND.ZA3_PROD = STGRAL.B2_COD
+			AND ST_VEND.ZA3_LOCAL = STGRAL.B2_LOCAL
+		LEFT JOIN #PEDIDOSCOMPRA PC
+			ON C7_PRODUTO = STGRAL.B2_COD
+			AND C7_LOCAL = STGRAL.B2_LOCAL
+		LEFT JOIN #PEDIDOSVENTA PV
+			ON PV.C6_PRODUTO = STGRAL.B2_COD
+			AND PV.C6_LOCAL = STGRAL.B2_LOCAL
+		LEFT JOIN #PEDIDOSBENEF BENEFORIG
+			ON BENEFORIG.C6_PRODUTO = STGRAL.B2_COD
+			AND BENEFORIG.C6_LOCAL = STGRAL.B2_LOCAL
+		LEFT JOIN #PEDIDOSBENEF BENEFDEST
+			ON BENEFDEST.C6_PRODUTO = STGRAL.B2_COD
+			AND BENEFDEST.C6_LOCDEST = STGRAL.B2_LOCAL
+		LEFT JOIN #RTOSALPEND TRFSAL
+			ON TRFSAL.D2_COD = STGRAL.B2_COD
+			AND TRFSAL.D2_LOCAL = STGRAL.B2_LOCAL
+		LEFT JOIN #ORDPROD ORDPROD
+			ON ORDPROD.C2_PRODUTO = STGRAL.B2_COD
+			AND ORDPROD.C2_LOCAL = STGRAL.B2_LOCAL
+		LEFT JOIN #RESERVAS RESERV
+			ON RESERV.D4_PRODUTO = STGRAL.B2_COD
+			AND RESERV.D4_LOCAL = STGRAL.B2_LOCAL
+	WHERE STGRAL.D_E_L_E_T_ <> '*'
+	GROUP BY NNR_CODIGO
+		,NNR_DESCRI
+		,NNR_XTIPO
+		,B1_COD
+		,B1_DESC
+		,B1_XBANDA
+		,PV.PVPEND
+		,PC.PCPEND
+		,ST_DEV.SLDDEVOL
+		,ST_VEND.SLDVEND
+		,ST_VEND.OTROVEND
+		,BENEFORIG.BENEFPEND
+		,BENEFDEST.BENEFPEND
+		,TRFSAL.TRFENTPEND
+		,ORDPROD.PRODUCT
+		,RESERV.RESERVAS
+
+IF @TPVISUAL = 1
+
+	SELECT CODDEP
+		,DESDEP
+		,TIPDEP
+		,COD
+		,DESCRIP
+		,XCODIGO
+		,XDESCRI
+		/*    1      +   3    -   2    +   8   -    7    +   10   -      6     +     5        */
+		,STOCKFISICO + PCPEND - PVPEND + PRODC - REFPROD + SOLTRF - TRFSALPEND + TRFENTPEND AS DISPGRAL		
+		/*    1      +   3    -   2    +   8   -    7    +   10   -      6     +     5        */
+		,STOCKFISICO + PCPEND - PVPEND + PRODC - REFPROD + SOLTRF - TRFSALPEND + TRFENTPEND - ASIGOTROS AS DISPAJUS		
+		,STOCKFISICO	-- 01 Sumatoria de B8_SALDO( producto mas descripcion adicional)
+		,PVPEND			-- 02 Sumatoria de (C6_QTDVEN-C6_QTDENT) de pedidos de venta normales según producto y descripcion adicional 
+		,PCPEND			-- 03 Sumatoria de saldos de pedidos de compra según producto y descripcion adicional
+		,SLDDEVOL		-- 04 Sumatoria de B8_saldo que se encuentren en deposito de devolución
+		,TRFENTPEND		-- 05 RTS pendientes de recibir
+		,TRFSALPEND		-- 06 Sumatoria de (C6_QTDVEN-C6_QTDENT) de pedidos de venta beneficiamiento según producto y descripcion adicional
+		,REFPROD		-- 07 Para lotes, no se usa
+		,PRODC			-- 08 Para lotes, no se usa
+		,ASIGVIG		-- 09 ZA3_SALDO para vendedores y que se encuentre vigente
+		,SOLTRF			-- 10 Sumatoria de (C6_QTDVEN-C6_QTDENT) de pedidos de venta beneficiamiento según producto y descripcion adicional 
+		,ASIGOTROS		-- 11 ZA3_SALDO de otros vendedores vigente
+	FROM #SALDO_FINAL
+
+ELSE
+
+	SELECT CODDEP
+		,XDESCRI
+		,TIPDEP
+		,ASIGVIG		-- 09 ZA3_SALDO para vendedores y que se encuentre vigente
+		,STOCKFISICO + PCPEND - PVPEND + PRODC - REFPROD + SOLTRF - TRFSALPEND + TRFENTPEND - ASIGOTROS AS DISPAJUS		
+		,STOCKFISICO	-- 01 Sumatoria de B8_SALDO( producto mas descripcion adicional)
+	FROM #SALDO_FINAL
+
+DROP TABLE #FILDEP
+DROP TABLE #FILPROD
+
+DROP TABLE #PEDIDOSCOMPRA
+DROP TABLE #PEDIDOSVENTA
+DROP TABLE #PEDIDOSBENEF
+DROP TABLE #STOCKDEVOLUCION
+DROP TABLE #STOCKVENDEDOR
+DROP TABLE #RTOSALPEND
+DROP TABLE #ORDPROD
+DROP TABLE #RESERVAS
+
+DROP TABLE #SALDO_FINAL
+
+
